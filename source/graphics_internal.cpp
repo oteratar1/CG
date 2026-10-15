@@ -25,6 +25,8 @@ namespace graphics::internal {
 
 namespace {
 
+GLFWwindow* vk_window = nullptr;
+
 VkInstance vk_instance;
 uint32_t vk_api_version;
 VkSurfaceKHR vk_surface;
@@ -37,6 +39,9 @@ uint32_t vk_swapchain_current_image;
 uint32_t vk_swapchain_resize_width;
 uint32_t vk_swapchain_resize_height;
 bool vk_swapchain_resize_require;
+
+// true only if prepare() successfully acquired an image for this frame
+bool vk_frame_valid = false;
 
 VkFormat vk_depth_buffer_format = VK_FORMAT_UNDEFINED;
 VkImage vk_image_depth_buffer;
@@ -243,7 +248,31 @@ void drawImGUI() {
 	vkEndCommandBuffer(vk_imgui_command_buffer);
 }
 
+// True while the window is minimized (surface extent is 0x0 on Windows).
+bool surfaceIsMinimized() {
+	VkSurfaceCapabilitiesKHR capabilities{};
+
+	if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context.physical_device, vk_surface,
+												  &capabilities) != VK_SUCCESS) {
+		return false;
+	}
+
+	return capabilities.currentExtent.width == 0 || capabilities.currentExtent.height == 0;
+}
+
+// Sleep until the window is restored (or closed).
+void waitWhileMinimized() {
+	while (surfaceIsMinimized() && !glfwWindowShouldClose(vk_window)) {
+		glfwWaitEvents();
+	}
+}
+
 bool rebuildSwapchain(uint32_t width, uint32_t height) {
+	// Cannot create a swapchain for a minimized window; try again later.
+	if (surfaceIsMinimized()) {
+		return false;
+	}
+
 	vkQueueWaitIdle(context.graphics_queue);
 
 	vkb::SwapchainBuilder sb(context.physical_device, context.device, vk_surface,
@@ -257,6 +286,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 					   .build();
 	if (!sb_result) {
 		std::cerr << sb_result.error().message() << '\n';
+		return false;
 	}
 
 	auto vkb_swapchain = sb_result.value();
@@ -387,6 +417,8 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 Context context;
 
 bool initialize(GLFWwindow* const window) {
+	vk_window = window;
+
 	vkb::InstanceBuilder ib;
 
 	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
@@ -480,6 +512,11 @@ bool initialize(GLFWwindow* const window) {
 	vk_swapchain_images = vkb_swapchain.get_images().value();
 	vk_swapchain_image_views = vkb_swapchain.get_image_views().value();
 	vk_swapchain_current_image = UINT32_MAX;
+
+	// Sensible defaults until the first resize callback arrives.
+	vk_swapchain_resize_width = context.swapchain_extent.width;
+	vk_swapchain_resize_height = context.swapchain_extent.height;
+	vk_swapchain_resize_require = false;
 
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
@@ -720,7 +757,12 @@ void resize(uint32_t width, uint32_t height) {
 }
 
 FrameData prepare() {
+	vk_frame_valid = false;
+
 	vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX);
+
+	// If the window is minimized, sleep here until it is restored.
+	waitWhileMinimized();
 
 retry_acquire:
 	switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
@@ -730,7 +772,14 @@ retry_acquire:
 		break;
 
 	case VK_ERROR_OUT_OF_DATE_KHR:
-		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
+		waitWhileMinimized();
+
+		if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+			if (glfwWindowShouldClose(vk_window)) {
+				return {};
+			}
+			glfwWaitEvents();
+		}
 		goto retry_acquire;
 
 	case VK_SUBOPTIMAL_KHR:
@@ -744,6 +793,8 @@ retry_acquire:
 
 	vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
 
+	vk_frame_valid = true;
+
 	return {
 		.framebuffer = vk_framebuffers[vk_swapchain_current_image],
 		.command_buffer = vk_command_buffer,
@@ -751,6 +802,11 @@ retry_acquire:
 }
 
 void submitAndPresent() {
+	// prepare() did not produce a frame (e.g. window is closing): nothing to submit.
+	if (!vk_frame_valid) {
+		return;
+	}
+
 	drawImGUI();
 
 	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -785,8 +841,10 @@ void submitAndPresent() {
 	if (result == VK_ERROR_OUT_OF_DATE_KHR ||
 	    result == VK_SUBOPTIMAL_KHR ||
 	    vk_swapchain_resize_require) {
+		// Returns false (and does nothing) while the window is minimized;
+		// prepare() will rebuild the swapchain after the window is restored.
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-	} else {
+	} else if (result != VK_SUCCESS) {
 		std::cerr << "Failed to present Vulkan swapchain image\n";
 	}
 }
